@@ -39,6 +39,39 @@ fail(){ echo "Error: $*" >&2; exit 1; }
 need_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || fail "Run this command with sudo."; }
 valid_name(){ [[ "$1" =~ ^[A-Za-z0-9_-]{1,32}$ ]]; }
 
+allocate_profile_ip() {
+  python3 - "$DATA_DIR" "$PROFILE_CCD_DIR" <<'PY'
+import glob, json, os, sys
+data_dir, ccd_dir = sys.argv[1:]
+used = set()
+for path in glob.glob(os.path.join(data_dir, '*.json')):
+    try:
+        ip = json.load(open(path)).get('ip', '')
+        if ip.startswith('10.9.0.'):
+            used.add(ip)
+    except Exception:
+        pass
+for path in glob.glob(os.path.join(ccd_dir, '*')):
+    if not os.path.isfile(path):
+        continue
+    try:
+        with open(path) as f:
+            for line in f:
+                fields = line.split()
+                if len(fields) >= 2 and fields[0] == 'ifconfig-push':
+                    used.add(fields[1])
+    except OSError:
+        pass
+for host in range(2, 128):
+    candidate = f'10.9.0.{host}'
+    if candidate not in used:
+        print(candidate)
+        break
+else:
+    sys.exit(2)
+PY
+}
+
 install_manager_helpers(){
   install -d -m 755 "$DATA_DIR"; chmod 755 "$DATA_DIR"; install -d -m 700 "$CLIENT_DIR" "$CCD_DIR" "$PROFILE_CCD_DIR"
   cat > /usr/local/sbin/openvpn-client-connect <<'PY'
@@ -244,25 +277,32 @@ EOFUDP
 
 adopt_existing(){
   need_root
-  [[ -f "$SERVER_CONF" ]] || fail "Current configuration file was not found: $SERVER_CONF"
+  [[ -f "$SERVER_CONF" ]] || fail "Current TCP configuration was not found: $SERVER_CONF"
+  [[ -f "$UDP_CONF" ]] || fail "Current UDP configuration was not found: $UDP_CONF. Adoption requires the existing UDP instance."
   [[ -n "$WAN_IF" ]] || fail 'Internet interface (default route) was not found.'
   command -v openvpn >/dev/null || fail 'OpenVPN is not installed.'
-  grep -Eq '^[[:space:]]*dev[[:space:]]+tun([[:space:]]|$)' "$SERVER_CONF" || fail 'This script supports servers using dev tun only.'
-  grep -Eq '^[[:space:]]*server[[:space:]]+10\.8\.0\.0[[:space:]]+255\.255\.255\.0' "$SERVER_CONF" || fail 'The server network does not match 10.8.0.0/24. Migration stopped to avoid conflicts.'
-  local old_ca old_crl
-  old_ca=$(awk '$1=="ca" {print $2; exit}' "$SERVER_CONF")
-  old_crl=$(awk '$1=="crl-verify" {print $2; exit}' "$SERVER_CONF")
-  [[ -n "$old_ca" && -r "$old_ca" ]] || fail 'The current CA path in server.conf was not found or is not readable.'
+  grep -Eq '^[[:space:]]*dev[[:space:]]+tun([[:space:]]|$)' "$SERVER_CONF" || fail 'The existing TCP server must use dev tun.'
+  grep -Eq '^[[:space:]]*server[[:space:]]+10\.8\.0\.0[[:space:]]+255\.255\.255\.0' "$SERVER_CONF" || fail 'The TCP server network does not match 10.8.0.0/24. Migration stopped.'
+  grep -Eq '^[[:space:]]*dev[[:space:]]+tun1([[:space:]]|$)' "$UDP_CONF" || fail 'The existing UDP instance must use dev tun1.'
+  grep -Eq '^[[:space:]]*server[[:space:]]+10\.9\.0\.0[[:space:]]+255\.255\.255\.0' "$UDP_CONF" || fail 'The UDP server network does not match 10.9.0.0/24. Migration stopped.'
+  local old_ca old_crl stamp udp_backup
+  old_ca=$(awk '$1=="ca" {print $2; exit}' "$UDP_CONF")
+  old_crl=$(awk '$1=="crl-verify" {print $2; exit}' "$UDP_CONF")
+  [[ -n "$old_ca" && -r "$old_ca" ]] || fail 'The current CA path in udp.conf was not found or is not readable.'
   [[ ! -e "$PKI_DIR/pki" ]] || fail 'The manager PKI already exists. Do not run adoption again.'
-  echo 'This operation backs up the current configuration and introduces a separate manager CA for new users.'
-  echo 'OpenVPN will restart once at the end. VPN connections may drop briefly; SSH rules will not be changed.'
+  echo 'Adoption backs up the existing configs and adds a separate CA for manager-issued UDP clients.'
+  echo 'The TCP OpenVPN configuration/service and WireGuard configuration/service will not be modified or restarted.'
+  echo 'The UDP service may disconnect briefly while its configuration is updated.'
   read -rp 'Type YES exactly to continue: ' confirm
   [[ "$confirm" == YES ]] || { echo 'Cancelled.'; return 0; }
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
   apt-get install -y easy-rsa ufw iptables python3
-  install -d -m 700 "$PKI_DIR" "$CLIENT_DIR" "$CCD_DIR" "$DATA_DIR" /var/log/openvpn
-  cp -a "$SERVER_CONF" "$SERVER_CONF.before-openvpn-manager.$(date +%Y%m%d%H%M%S)"
+  install -d -m 700 "$PKI_DIR" "$CLIENT_DIR" "$PROFILE_CCD_DIR" "$DATA_DIR" /var/log/openvpn
+  stamp=$(date +%Y%m%d%H%M%S)
+  cp -a "$SERVER_CONF" "$SERVER_CONF.before-openvpn-manager.$stamp"
+  udp_backup="$UDP_CONF.before-openvpn-manager.$stamp"
+  cp -a "$UDP_CONF" "$udp_backup"
   cp -a "$old_ca" "$OVPN_DIR/ca-before-manager.crt"
   if [[ -n "$old_crl" && -r "$old_crl" ]]; then cp -a "$old_crl" "$OVPN_DIR/crl-before-manager.pem"; fi
   cp -r /usr/share/easy-rsa/* "$PKI_DIR/"
@@ -278,59 +318,61 @@ adopt_existing(){
     install -m 644 "$OVPN_DIR/manager-crl.pem" "$OVPN_DIR/crl-manager-bundle.pem"
   fi
   chmod 644 "$OVPN_DIR/crl-manager-bundle.pem"
-  # Keep the old trust certificate and append the manager CA for newly issued clients.
+  # Preserve the existing UDP CA and add the manager CA; leave the TCP trust chain untouched.
   cat "$OVPN_DIR/ca-before-manager.crt" "$PKI_DIR/pki/ca.crt" > "$OVPN_DIR/ca-manager-bundle.crt"
   chmod 644 "$OVPN_DIR/ca-manager-bundle.crt"
   install_manager_helpers
-  # Change only known directives; preserve all unrelated server settings.
-  sed -i -E "s|^[[:space:]]*ca[[:space:]]+.*|ca $OVPN_DIR/ca-manager-bundle.crt|" "$SERVER_CONF"
-  if grep -Eq '^[[:space:]]*crl-verify[[:space:]]' "$SERVER_CONF"; then
-    sed -i -E "s|^[[:space:]]*crl-verify[[:space:]]+.*|crl-verify $OVPN_DIR/crl-manager-bundle.pem|" "$SERVER_CONF"
-  else echo "crl-verify $OVPN_DIR/crl-manager-bundle.pem" >> "$SERVER_CONF"; fi
-  grep -Eq '^[[:space:]]*client-config-dir[[:space:]]' "$SERVER_CONF" || echo "client-config-dir $CCD_DIR" >> "$SERVER_CONF"
-  # Keep the existing server pool unchanged; OpenVPN's server directive manages the dynamic pool.
-  grep -Eq '^[[:space:]]*client-connect[[:space:]]' "$SERVER_CONF" || echo 'client-connect /usr/local/sbin/openvpn-client-connect' >> "$SERVER_CONF"
-  grep -Eq '^[[:space:]]*script-security[[:space:]]' "$SERVER_CONF" || echo 'script-security 2' >> "$SERVER_CONF"
-  grep -Eq '^[[:space:]]*status[[:space:]]' "$SERVER_CONF" || echo 'status /var/log/openvpn/status.log 10' >> "$SERVER_CONF"
-  grep -Eq '^[[:space:]]*status-version[[:space:]]' "$SERVER_CONF" || echo 'status-version 2' >> "$SERVER_CONF"
-  if [[ -f "$UDP_CONF" ]]; then
-    cp -a "$UDP_CONF" "$UDP_CONF.before-openvpn-manager.$(date +%Y%m%d%H%M%S)"
-    sed -i -E "s|^[[:space:]]*ca[[:space:]]+.*|ca $OVPN_DIR/ca-manager-bundle.crt|" "$UDP_CONF"
-    if grep -Eq '^[[:space:]]*crl-verify[[:space:]]' "$UDP_CONF"; then sed -i -E "s|^[[:space:]]*crl-verify[[:space:]]+.*|crl-verify $OVPN_DIR/crl-manager-bundle.pem|" "$UDP_CONF"; else echo "crl-verify $OVPN_DIR/crl-manager-bundle.pem" >> "$UDP_CONF"; fi
-    if grep -Eq '^[[:space:]]*client-config-dir[[:space:]]' "$UDP_CONF"; then sed -i -E "s|^[[:space:]]*client-config-dir[[:space:]]+.*|client-config-dir $PROFILE_CCD_DIR|" "$UDP_CONF"; else echo "client-config-dir $PROFILE_CCD_DIR" >> "$UDP_CONF"; fi
-    grep -Eq '^[[:space:]]*script-security[[:space:]]' "$UDP_CONF" || echo 'script-security 2' >> "$UDP_CONF"
-    grep -Eq '^[[:space:]]*client-connect[[:space:]]' "$UDP_CONF" || echo 'client-connect /usr/local/sbin/openvpn-client-connect' >> "$UDP_CONF"
-    if grep -Eq '^[[:space:]]*status[[:space:]]' "$UDP_CONF"; then sed -i -E "s|^[[:space:]]*status[[:space:]]+.*|status $PROFILE_STATUS 10|" "$UDP_CONF"; else echo "status $PROFILE_STATUS 10" >> "$UDP_CONF"; fi
-    grep -Eq '^[[:space:]]*status-version[[:space:]]' "$UDP_CONF" || echo 'status-version 2' >> "$UDP_CONF"
-    grep -Eq '^[[:space:]]*mssfix[[:space:]]+1360([[:space:]]|$)' "$UDP_CONF" || echo 'mssfix 1360' >> "$UDP_CONF"
+  sed -i -E "s|^[[:space:]]*ca[[:space:]]+.*|ca $OVPN_DIR/ca-manager-bundle.crt|" "$UDP_CONF"
+  if grep -Eq '^[[:space:]]*crl-verify[[:space:]]' "$UDP_CONF"; then
+    sed -i -E "s|^[[:space:]]*crl-verify[[:space:]]+.*|crl-verify $OVPN_DIR/crl-manager-bundle.pem|" "$UDP_CONF"
+  else
+    echo "crl-verify $OVPN_DIR/crl-manager-bundle.pem" >> "$UDP_CONF"
   fi
+  if grep -Eq '^[[:space:]]*client-config-dir[[:space:]]' "$UDP_CONF"; then
+    sed -i -E "s|^[[:space:]]*client-config-dir[[:space:]]+.*|client-config-dir $PROFILE_CCD_DIR|" "$UDP_CONF"
+  else
+    echo "client-config-dir $PROFILE_CCD_DIR" >> "$UDP_CONF"
+  fi
+  grep -Eq '^[[:space:]]*script-security[[:space:]]' "$UDP_CONF" || echo 'script-security 2' >> "$UDP_CONF"
+  grep -Eq '^[[:space:]]*client-connect[[:space:]]' "$UDP_CONF" || echo 'client-connect /usr/local/sbin/openvpn-client-connect' >> "$UDP_CONF"
+  if grep -Eq '^[[:space:]]*status[[:space:]]' "$UDP_CONF"; then
+    sed -i -E "s|^[[:space:]]*status[[:space:]]+.*|status $PROFILE_STATUS 10|" "$UDP_CONF"
+  else
+    echo "status $PROFILE_STATUS 10" >> "$UDP_CONF"
+  fi
+  grep -Eq '^[[:space:]]*status-version[[:space:]]' "$UDP_CONF" || echo 'status-version 2' >> "$UDP_CONF"
+  grep -Eq '^[[:space:]]*mssfix[[:space:]]+1360([[:space:]]|$)' "$UDP_CONF" || echo 'mssfix 1360' >> "$UDP_CONF"
+  # Reserve 10.9.0.2-10.9.0.127 for manager CCD clients; keep dynamic clients in .128-.253.
+  if grep -Eq '^[[:space:]]*ifconfig-pool[[:space:]]' "$UDP_CONF"; then
+    sed -i -E 's|^[[:space:]]*ifconfig-pool[[:space:]]+.*|ifconfig-pool 10.9.0.128 10.9.0.253 255.255.255.0|' "$UDP_CONF"
+  else
+    echo 'ifconfig-pool 10.9.0.128 10.9.0.253 255.255.255.0' >> "$UDP_CONF"
+  fi
+  # Persist forwarding without reloading every sysctl configuration on the host.
   echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-openvpn-forward.conf
-  sysctl --system >/dev/null
-  # Add persistent NAT without removing the existing WireGuard NAT rules.
-  if ! grep -q '10\.8\.0\.0/24.*MASQUERADE' /etc/ufw/before.rules; then
-    cp -a /etc/ufw/before.rules "/etc/ufw/before.rules.before-openvpn-manager.$(date +%Y%m%d%H%M%S)"
-    if grep -q '^\*nat$' /etc/ufw/before.rules; then
-      grep -q '10\.8\.0\.0/24.*MASQUERADE' /etc/ufw/before.rules || sed -i '/^-A POSTROUTING/i -A POSTROUTING -s 10.8.0.0/24 -o '"$WAN_IF"' -j MASQUERADE' /etc/ufw/before.rules
-    else
-      sed -i "/^\*filter/i *nat\n:POSTROUTING ACCEPT [0:0]\n-A POSTROUTING -s 10.8.0.0/24 -o $WAN_IF -j MASQUERADE\nCOMMIT\n" /etc/ufw/before.rules
-    fi
-  fi
-  ufw route allow in on tun0 out on "$WAN_IF" from 10.8.0.0/24 to any
-  if [[ -f "$UDP_CONF" ]]; then
-    ufw allow "$PROFILE_PORT/udp"
-    ufw route allow in on "$PROFILE_IF" out on "$WAN_IF" from "$PROFILE_NET" to any
-    ensure_nat_rule "$PROFILE_NET"
-  fi
-  ufw reload
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null
+  ensure_nat_rule "$PROFILE_NET"
+  iptables -t nat -C POSTROUTING -s "$PROFILE_NET" -o "$WAN_IF" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s "$PROFILE_NET" -o "$WAN_IF" -j MASQUERADE
+  ufw allow "$PROFILE_PORT/udp"
+  ufw route allow in on "$PROFILE_IF" out on "$WAN_IF" from "$PROFILE_NET" to any
   systemctl daemon-reload
   systemctl enable --now openvpn-quota-check.timer
-  if ! openvpn --config "$SERVER_CONF" --test-crypto >/dev/null 2>&1; then
-    echo 'Warning: the generic --test-crypto check failed. Review the logs before restarting.'
+  if ! openvpn --config "$UDP_CONF" --test-crypto >/dev/null 2>&1; then
+    echo 'Warning: OpenVPN crypto/config test returned nonzero; the UDP service restart is still checked below.'
   fi
-  systemctl restart openvpn-server@server
-  if [[ -f "$UDP_CONF" ]]; then systemctl restart openvpn-server@udp; fi
-  systemctl is-active --quiet openvpn-server@server || fail 'Service did not become active after migration. Backups of server.conf and the CA are available; inspect service status.'
-  echo 'Management has been added to the existing server. Previous settings were backed up.'
+  if ! systemctl restart openvpn-server@udp; then
+    echo 'UDP service failed to restart. Restoring its original configuration.'
+    cp -a "$udp_backup" "$UDP_CONF"
+    systemctl restart openvpn-server@udp || true
+    fail "Adoption was rolled back for udp.conf. Original backup: $udp_backup"
+  fi
+  if ! systemctl is-active --quiet openvpn-server@udp; then
+    cp -a "$udp_backup" "$UDP_CONF"
+    systemctl restart openvpn-server@udp || true
+    fail "UDP service did not become active; original udp.conf was restored from $udp_backup"
+  fi
+  echo 'Management has been added to the existing UDP instance.'
+  echo 'The existing TCP OpenVPN instance and WireGuard service/configuration were left unchanged.'
   echo 'Create a new user with: sudo openvpn-manager add friend1 30 10'
 }
 
@@ -339,7 +381,7 @@ add_client(){
   [[ -f "$SERVER_CONF" ]] || fail "OpenVPN server config was not found: $SERVER_CONF. Select option 1 for a fresh server."
   [[ -d "$PKI_DIR/pki" ]] || fail "Manager PKI is unavailable. Select option 6 to adopt the existing server, then create the client again."
   [[ -f "$UDP_CONF" ]] || fail "UDP server config was not found: $UDP_CONF. Configure the UDP instance before creating profiles."
-  local name="${1:-}" days="${2:-365}" quota="${3:-0}" ip last endpoint="${OPENVPN_ENDPOINT:-${PUBLIC_IP:-}}"
+  local name="${1:-}" days="${2:-365}" quota="${3:-0}" ip endpoint="${OPENVPN_ENDPOINT:-${PUBLIC_IP:-}}"
   if [[ -t 0 ]]; then read -rp "Public VPN hostname or IP [${endpoint:-required}]: " entered_endpoint; endpoint="${entered_endpoint:-$endpoint}"; fi
   [[ -n "$endpoint" ]] || fail "Set OPENVPN_ENDPOINT to your VPN hostname/IP or enter it at the prompt."
   [[ "$endpoint" =~ ^[A-Za-z0-9.-]+$ ]] || fail "Invalid endpoint. Enter a hostname or IPv4 address without a scheme or port."
@@ -350,11 +392,9 @@ add_client(){
   [[ "$quota" == '-' ]] && quota=0
   [[ "$days" =~ ^[0-9]+$ ]] && ((days>=1 && days<=3650)) || fail 'Validity must be between 1 and 3650 days.'
   [[ "$quota" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail 'Quota must be specified in GB; zero means unlimited.'
-  last=$(find "$DATA_DIR" -maxdepth 1 -name '*.json' -printf '%f\n' 2>/dev/null | wc -l)
-  ((last<240)) || fail 'The dedicated client IP pool is full.'
-  ip="10.9.0.$((last+10))"
   [[ -e "$DATA_DIR/$name.json" ]] && fail 'A manager record for this name already exists.'
   [[ -e "$PROFILE_CCD_DIR/$name" ]] && fail 'A UDP client configuration already exists for this name.'
+  ip="$(allocate_profile_ip)" || fail 'The reserved manager IP range 10.9.0.2-10.9.0.127 is full. No client was created.'
   cd "$PKI_DIR"
   export EASYRSA_BATCH=1 EASYRSA_PKI="$PKI_DIR/pki" EASYRSA_CERT_EXPIRE="$days"
   ./easyrsa build-client-full "$name" nopass
@@ -372,7 +412,6 @@ PY
   local out="$CLIENT_DIR/$name.ovpn"
   { printf 'client\ndev tun\nproto udp\nremote %s %s\nresolv-retry infinite\nnobind\npersist-key\npersist-tun\nremote-cert-tls server\nauth SHA256\ndata-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305\nmssfix 1360\nverb 3\nkey-direction 1\n<ca>\n' "$endpoint" "$PROFILE_PORT"; if [[ -r "$OVPN_DIR/ca-manager-bundle.crt" ]]; then cat "$OVPN_DIR/ca-manager-bundle.crt"; elif [[ -r "$OVPN_DIR/ca-before-manager.crt" ]]; then cat "$OVPN_DIR/ca-before-manager.crt"; else cat "$PKI_DIR/pki/ca.crt"; fi; printf '</ca>\n<cert>\n'; awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/' "$PKI_DIR/pki/issued/$name.crt"; printf '</cert>\n<key>\n'; cat "$PKI_DIR/pki/private/$name.key"; printf '</key>\n<tls-auth>\n'; cat "$OVPN_DIR/ta.key"; printf '</tls-auth>\n'; } > "$out"
   chmod 600 "$out"
-  systemctl reload openvpn-server@server 2>/dev/null || systemctl restart openvpn-server@server
   systemctl reload openvpn-server@udp 2>/dev/null || systemctl restart openvpn-server@udp
   echo "Client profile created: $out"
   echo "Assigned IP: $ip | Validity: $days days | quota: ${quota} GB (0=unlimited)"
@@ -406,8 +445,7 @@ PY
   if [[ -f "$DATA_DIR/$name.json" ]]; then ip=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("ip",""))' "$DATA_DIR/$name.json");
     for spec in "-s $ip" "-d $ip"; do read -r flag addr <<< "$spec"; iptables -C FORWARD "$flag" "$addr" -j DROP 2>/dev/null || iptables -I FORWARD "$flag" "$addr" -j DROP; done
   fi
-  rm -f "$CCD_DIR/$name" "$PROFILE_CCD_DIR/$name"
-  systemctl reload openvpn-server@server 2>/dev/null || systemctl restart openvpn-server@server
+  rm -f "$PROFILE_CCD_DIR/$name"
   systemctl reload openvpn-server@udp 2>/dev/null || systemctl restart openvpn-server@udp
   echo "Certificate $name was revoked. Reconnection should be rejected. Also remove the profile from the user's device."
 }
@@ -442,15 +480,8 @@ menu(){
         if [[ ! -d "$PKI_DIR/pki" ]]; then
           if [[ -f "$SERVER_CONF" ]]; then
             echo 'The existing server has no OpenVPN Manager PKI yet.'
-            echo 'Adoption backs up the configuration, adds the manager CA, and briefly restarts OpenVPN.'
-            read -rp 'Type YES to adopt this existing server before creating a client: ' adopt_confirm
-            if [[ "$adopt_confirm" == YES ]]; then
-              adopt_existing
-              [[ -d "$PKI_DIR/pki" ]] || { echo 'Adoption was not completed; client creation skipped.'; continue; }
-            else
-              echo 'Client creation skipped. Run option 6 first, then choose option 2.'
-              continue
-            fi
+            adopt_existing
+            [[ -d "$PKI_DIR/pki" ]] || { echo 'Adoption was not completed; client creation skipped.'; continue; }
           else
             echo 'No OpenVPN Manager PKI or existing server configuration was found.'
             echo 'Choose option 1 to install on a fresh server, or option 6 to adopt an existing server.'
