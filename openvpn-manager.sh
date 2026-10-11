@@ -249,8 +249,9 @@ adopt_existing(){
   command -v openvpn >/dev/null || fail 'OpenVPN is not installed.'
   grep -Eq '^[[:space:]]*dev[[:space:]]+tun([[:space:]]|$)' "$SERVER_CONF" || fail 'This script supports servers using dev tun only.'
   grep -Eq '^[[:space:]]*server[[:space:]]+10\.8\.0\.0[[:space:]]+255\.255\.255\.0' "$SERVER_CONF" || fail 'The server network does not match 10.8.0.0/24. Migration stopped to avoid conflicts.'
-  local old_ca
+  local old_ca old_crl
   old_ca=$(awk '$1=="ca" {print $2; exit}' "$SERVER_CONF")
+  old_crl=$(awk '$1=="crl-verify" {print $2; exit}' "$SERVER_CONF")
   [[ -n "$old_ca" && -r "$old_ca" ]] || fail 'The current CA path in server.conf was not found or is not readable.'
   [[ ! -e "$PKI_DIR/pki" ]] || fail 'The manager PKI already exists. Do not run adoption again.'
   echo 'This operation backs up the current configuration and introduces a separate manager CA for new users.'
@@ -263,6 +264,7 @@ adopt_existing(){
   install -d -m 700 "$PKI_DIR" "$CLIENT_DIR" "$CCD_DIR" "$DATA_DIR" /var/log/openvpn
   cp -a "$SERVER_CONF" "$SERVER_CONF.before-openvpn-manager.$(date +%Y%m%d%H%M%S)"
   cp -a "$old_ca" "$OVPN_DIR/ca-before-manager.crt"
+  if [[ -n "$old_crl" && -r "$old_crl" ]]; then cp -a "$old_crl" "$OVPN_DIR/crl-before-manager.pem"; fi
   cp -r /usr/share/easy-rsa/* "$PKI_DIR/"
   cd "$PKI_DIR"
   export EASYRSA_BATCH=1 EASYRSA_PKI="$PKI_DIR/pki" EASYRSA_CA_EXPIRE=3650 EASYRSA_CERT_EXPIRE=3650 EASYRSA_CRL_DAYS=3650
@@ -270,13 +272,19 @@ adopt_existing(){
   ./easyrsa build-ca nopass
   ./easyrsa gen-crl
   install -m 644 pki/crl.pem "$OVPN_DIR/manager-crl.pem"
+  if [[ -r "$OVPN_DIR/crl-before-manager.pem" ]]; then
+    cat "$OVPN_DIR/crl-before-manager.pem" "$OVPN_DIR/manager-crl.pem" > "$OVPN_DIR/crl-manager-bundle.pem"
+    chmod 644 "$OVPN_DIR/crl-manager-bundle.pem"
+  fi
   # Keep the old trust certificate and append the manager CA for newly issued clients.
   cat "$OVPN_DIR/ca-before-manager.crt" "$PKI_DIR/pki/ca.crt" > "$OVPN_DIR/ca-manager-bundle.crt"
   chmod 644 "$OVPN_DIR/ca-manager-bundle.crt"
   install_manager_helpers
   # Change only known directives; preserve all unrelated server settings.
   sed -i -E "s|^[[:space:]]*ca[[:space:]]+.*|ca $OVPN_DIR/ca-manager-bundle.crt|" "$SERVER_CONF"
-  grep -Eq '^[[:space:]]*crl-verify[[:space:]]' "$SERVER_CONF" || echo "crl-verify $OVPN_DIR/manager-crl.pem" >> "$SERVER_CONF"
+  if grep -Eq '^[[:space:]]*crl-verify[[:space:]]' "$SERVER_CONF"; then
+    sed -i -E "s|^[[:space:]]*crl-verify[[:space:]]+.*|crl-verify $OVPN_DIR/crl-manager-bundle.pem|" "$SERVER_CONF"
+  else echo "crl-verify $OVPN_DIR/crl-manager-bundle.pem" >> "$SERVER_CONF"; fi
   grep -Eq '^[[:space:]]*client-config-dir[[:space:]]' "$SERVER_CONF" || echo "client-config-dir $CCD_DIR" >> "$SERVER_CONF"
   if grep -Eq '^[[:space:]]*ifconfig-pool[[:space:]]' "$SERVER_CONF"; then sed -i -E 's|^[[:space:]]*ifconfig-pool[[:space:]].*|ifconfig-pool 10.8.0.2 10.8.0.9 255.255.255.0|' "$SERVER_CONF"; else echo 'ifconfig-pool 10.8.0.2 10.8.0.9 255.255.255.0' >> "$SERVER_CONF"; fi
   grep -Eq '^[[:space:]]*client-connect[[:space:]]' "$SERVER_CONF" || echo 'client-connect /usr/local/sbin/openvpn-client-connect' >> "$SERVER_CONF"
@@ -286,7 +294,7 @@ adopt_existing(){
   if [[ -f "$UDP_CONF" ]]; then
     cp -a "$UDP_CONF" "$UDP_CONF.before-openvpn-manager.$(date +%Y%m%d%H%M%S)"
     sed -i -E "s|^[[:space:]]*ca[[:space:]]+.*|ca $OVPN_DIR/ca-manager-bundle.crt|" "$UDP_CONF"
-    if grep -Eq '^[[:space:]]*crl-verify[[:space:]]' "$UDP_CONF"; then sed -i -E "s|^[[:space:]]*crl-verify[[:space:]]+.*|crl-verify $OVPN_DIR/manager-crl.pem|" "$UDP_CONF"; else echo "crl-verify $OVPN_DIR/manager-crl.pem" >> "$UDP_CONF"; fi
+    if grep -Eq '^[[:space:]]*crl-verify[[:space:]]' "$UDP_CONF"; then sed -i -E "s|^[[:space:]]*crl-verify[[:space:]]+.*|crl-verify $OVPN_DIR/crl-manager-bundle.pem|" "$UDP_CONF"; else echo "crl-verify $OVPN_DIR/crl-manager-bundle.pem" >> "$UDP_CONF"; fi
     if grep -Eq '^[[:space:]]*client-config-dir[[:space:]]' "$UDP_CONF"; then sed -i -E "s|^[[:space:]]*client-config-dir[[:space:]]+.*|client-config-dir $PROFILE_CCD_DIR|" "$UDP_CONF"; else echo "client-config-dir $PROFILE_CCD_DIR" >> "$UDP_CONF"; fi
     grep -Eq '^[[:space:]]*script-security[[:space:]]' "$UDP_CONF" || echo 'script-security 2' >> "$UDP_CONF"
     grep -Eq '^[[:space:]]*client-connect[[:space:]]' "$UDP_CONF" || echo 'client-connect /usr/local/sbin/openvpn-client-connect' >> "$UDP_CONF"
@@ -374,7 +382,15 @@ revoke_client(){
   cd "$PKI_DIR"; export EASYRSA_BATCH=1 EASYRSA_PKI="$PKI_DIR/pki" EASYRSA_CRL_DAYS=3650
   ./easyrsa revoke "$name"
   ./easyrsa gen-crl
-  if [[ -f "$OVPN_DIR/manager-crl.pem" ]]; then install -m 644 pki/crl.pem "$OVPN_DIR/manager-crl.pem"; else install -m 644 pki/crl.pem "$OVPN_DIR/crl.pem"; fi
+  if [[ -f "$OVPN_DIR/manager-crl.pem" ]]; then
+    install -m 644 pki/crl.pem "$OVPN_DIR/manager-crl.pem"
+    if [[ -r "$OVPN_DIR/crl-before-manager.pem" ]]; then
+      cat "$OVPN_DIR/crl-before-manager.pem" "$OVPN_DIR/manager-crl.pem" > "$OVPN_DIR/crl-manager-bundle.pem"
+      chmod 644 "$OVPN_DIR/crl-manager-bundle.pem"
+    fi
+  else
+    install -m 644 pki/crl.pem "$OVPN_DIR/crl.pem"
+  fi
   python3 - "$DATA_DIR/$name.json" <<'PY'
 import json,sys,os
 p=sys.argv[1]
