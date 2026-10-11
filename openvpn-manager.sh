@@ -73,7 +73,9 @@ PY
 }
 
 install_manager_helpers(){
-  install -d -m 755 "$DATA_DIR"; chmod 755 "$DATA_DIR"; install -d -m 700 "$CLIENT_DIR" "$CCD_DIR" "$PROFILE_CCD_DIR"
+  install -d -m 755 "$DATA_DIR"; chmod 755 "$DATA_DIR"; install -d -m 700 "$CLIENT_DIR" "$CCD_DIR"
+  # OpenVPN drops privileges to user "openvpn" before reading client CCD files.
+  install -d -m 755 "$PROFILE_CCD_DIR"; chmod 755 "$PROFILE_CCD_DIR"
   cat > /usr/local/sbin/openvpn-client-connect <<'PY'
 #!/usr/bin/env python3
 import json, os, sys, time
@@ -400,7 +402,7 @@ add_client(){
   export EASYRSA_BATCH=1 EASYRSA_PKI="$PKI_DIR/pki" EASYRSA_CERT_EXPIRE="$days"
   ./easyrsa build-client-full "$name" nopass
   printf 'ifconfig-push %s 255.255.255.0\n' "$ip" > "$PROFILE_CCD_DIR/$name"
-  chmod 600 "$PROFILE_CCD_DIR/$name"
+  chmod 644 "$PROFILE_CCD_DIR/$name"
   local expiry=0 quota_bytes=0
   expiry=$(( $(date +%s) + days*86400 ))
   if [[ "$quota" != 0 ]]; then quota_bytes=$(awk -v q="$quota" 'BEGIN{printf "%.0f",q*1073741824}'); fi
