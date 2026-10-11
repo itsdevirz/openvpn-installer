@@ -334,8 +334,13 @@ adopt_existing(){
 
 add_client(){
   need_root
-  [[ -d "$PKI_DIR/pki" && -f "$SERVER_CONF" ]] || fail 'OpenVPN manager PKI is unavailable.'
-  local name="${1:-}" days="${2:-365}" quota="${3:-0}" ip last
+  [[ -f "$SERVER_CONF" ]] || fail "OpenVPN server config was not found: $SERVER_CONF. Select option 1 for a fresh server."
+  [[ -d "$PKI_DIR/pki" ]] || fail "Manager PKI is unavailable. Select option 6 to adopt the existing server, then create the client again."
+  [[ -f "$UDP_CONF" ]] || fail "UDP server config was not found: $UDP_CONF. Configure the UDP instance before creating profiles."
+  local name="${1:-}" days="${2:-365}" quota="${3:-0}" ip last endpoint="${OPENVPN_ENDPOINT:-${PUBLIC_IP:-}}"
+  if [[ -t 0 ]]; then read -rp "Public VPN hostname or IP [${endpoint:-required}]: " entered_endpoint; endpoint="${entered_endpoint:-$endpoint}"; fi
+  [[ -n "$endpoint" ]] || fail "Set OPENVPN_ENDPOINT to your VPN hostname/IP or enter it at the prompt."
+  [[ "$endpoint" =~ ^[A-Za-z0-9.-]+$ ]] || fail "Invalid endpoint. Enter a hostname or IPv4 address without a scheme or port."
   if [[ -z "$name" ]]; then read -rp 'Client name (letters, numbers, _ or -): ' name; fi
   valid_name "$name" || fail 'Invalid name. Use only ASCII letters, numbers, underscores, or hyphens (max 32 characters).'
   [[ ! -e "$PKI_DIR/pki/issued/$name.crt" ]] || fail 'This name is already in use.'
@@ -347,6 +352,7 @@ add_client(){
   ((last<240)) || fail 'The dedicated client IP pool is full.'
   ip="10.9.0.$((last+10))"
   [[ -e "$DATA_DIR/$name.json" ]] && fail 'A manager record for this name already exists.'
+  [[ -e "$PROFILE_CCD_DIR/$name" ]] && fail 'A UDP client configuration already exists for this name.'
   cd "$PKI_DIR"
   export EASYRSA_BATCH=1 EASYRSA_PKI="$PKI_DIR/pki" EASYRSA_CERT_EXPIRE="$days"
   ./easyrsa build-client-full "$name" nopass
@@ -361,11 +367,6 @@ p,n,ip,exp,q=sys.argv[1:]; d={'name':n,'ip':ip,'expires_at':int(exp),'quota_byte
 with open(p,'w') as f: json.dump(d,f)
 os.chmod(p,0o644)
 PY
-  [[ -f "$UDP_CONF" ]] || fail "UDP server config not found: $UDP_CONF. Run adopt on the existing server or configure the UDP instance first."
-  local endpoint="${OPENVPN_ENDPOINT:-${PUBLIC_IP:-}}"
-  if [[ -t 0 ]]; then read -rp "Public VPN hostname or IP [${endpoint:-required}]: " entered_endpoint; endpoint="${entered_endpoint:-$endpoint}"; fi
-  [[ -n "$endpoint" ]] || fail "Set OPENVPN_ENDPOINT to your VPN hostname/IP or enter it at the prompt."
-  [[ "$endpoint" =~ ^[A-Za-z0-9.-]+$ ]] || fail "Invalid endpoint. Enter a hostname or IPv4 address without a scheme or port."
   local out="$CLIENT_DIR/$name.ovpn"
   { printf 'client\ndev tun\nproto udp\nremote %s %s\nresolv-retry infinite\nnobind\npersist-key\npersist-tun\nremote-cert-tls server\nauth SHA256\ndata-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305\nmssfix 1360\nverb 3\nkey-direction 1\n<ca>\n' "$endpoint" "$PROFILE_PORT"; if [[ -r "$OVPN_DIR/ca-manager-bundle.crt" ]]; then cat "$OVPN_DIR/ca-manager-bundle.crt"; elif [[ -r "$OVPN_DIR/ca-before-manager.crt" ]]; then cat "$OVPN_DIR/ca-before-manager.crt"; else cat "$PKI_DIR/pki/ca.crt"; fi; printf '</ca>\n<cert>\n'; awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/' "$PKI_DIR/pki/issued/$name.crt"; printf '</cert>\n<key>\n'; cat "$PKI_DIR/pki/private/$name.key"; printf '</key>\n<tls-auth>\n'; cat "$OVPN_DIR/ta.key"; printf '</tls-auth>\n'; } > "$out"
   chmod 600 "$out"
@@ -433,7 +434,30 @@ menu(){
     read -rp 'Select an option: ' n
     case "$n" in
       1) install_openvpn;;
-      2) read -rp 'Client name: ' a; read -rp 'Validity in days (default 365): ' b; b=${b:-365}; read -rp 'Quota in GB (0=Unlimited): ' c; c=${c:-0}; add_client "$a" "$b" "$c";;
+      2)
+        if [[ ! -d "$PKI_DIR/pki" ]]; then
+          if [[ -f "$SERVER_CONF" ]]; then
+            echo 'The existing server has no OpenVPN Manager PKI yet.'
+            echo 'Adoption backs up the configuration, adds the manager CA, and briefly restarts OpenVPN.'
+            read -rp 'Type YES to adopt this existing server before creating a client: ' adopt_confirm
+            if [[ "$adopt_confirm" == YES ]]; then
+              adopt_existing
+              [[ -d "$PKI_DIR/pki" ]] || { echo 'Adoption was not completed; client creation skipped.'; continue; }
+            else
+              echo 'Client creation skipped. Run option 6 first, then choose option 2.'
+              continue
+            fi
+          else
+            echo 'No OpenVPN Manager PKI or existing server configuration was found.'
+            echo 'Choose option 1 to install on a fresh server, or option 6 to adopt an existing server.'
+            continue
+          fi
+        fi
+        read -rp 'Client name: ' a
+        read -rp 'Validity in days (default 365): ' b; b=${b:-365}
+        read -rp 'Quota in GB (0=Unlimited): ' c; c=${c:-0}
+        add_client "$a" "$b" "$c"
+        ;;
       3) read -rp 'Client name to revoke: ' a; revoke_client "$a";;
       4) list_clients;; 5) status;; 6) adopt_existing;; 0) exit 0;; *) echo 'Invalid selection';;
     esac
