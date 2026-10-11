@@ -317,19 +317,18 @@ adopt_existing(){
   ./easyrsa build-ca nopass
   ./easyrsa gen-crl
   install -m 644 pki/crl.pem "$OVPN_DIR/manager-crl.pem"
-  # OpenVPN reads one CRL from a PEM file; use the manager CA's CRL directly.
-  # This instance had no active crl-verify directive before adoption.
-  install -m 644 "$OVPN_DIR/manager-crl.pem" "$OVPN_DIR/crl-manager-bundle.pem"
-  chmod 644 "$OVPN_DIR/crl-manager-bundle.pem"
-  # Preserve the existing UDP CA and add the manager CA; leave the TCP trust chain untouched.
+  # Keep the old CA trusted and add the manager CA. Do not apply the manager CA's
+  # CRL globally: it would not be the CRL for legacy certificates issued by old_ca.
   cat "$OVPN_DIR/ca-before-manager.crt" "$PKI_DIR/pki/ca.crt" > "$OVPN_DIR/ca-manager-bundle.crt"
   chmod 644 "$OVPN_DIR/ca-manager-bundle.crt"
   install_manager_helpers
   sed -i -E "s|^[[:space:]]*ca[[:space:]]+.*|ca $OVPN_DIR/ca-manager-bundle.crt|" "$UDP_CONF"
-  if grep -Eq '^[[:space:]]*crl-verify[[:space:]]' "$UDP_CONF"; then
-    sed -i -E "s|^[[:space:]]*crl-verify[[:space:]]+.*|crl-verify $OVPN_DIR/crl-manager-bundle.pem|" "$UDP_CONF"
+  # Per-client revocation/expiry for manager-issued profiles is enforced by client-connect.
+  # Preserve the pre-existing CRL setting only if one was already configured.
+  if [[ -n "$old_crl" ]]; then
+    sed -i -E "s|^[[:space:]]*crl-verify[[:space:]]+.*|crl-verify $old_crl|" "$UDP_CONF"
   else
-    echo "crl-verify $OVPN_DIR/crl-manager-bundle.pem" >> "$UDP_CONF"
+    sed -i -E '/^[[:space:]]*crl-verify[[:space:]]+/d' "$UDP_CONF"
   fi
   if grep -Eq '^[[:space:]]*client-config-dir[[:space:]]' "$UDP_CONF"; then
     sed -i -E "s|^[[:space:]]*client-config-dir[[:space:]]+.*|client-config-dir $PROFILE_CCD_DIR|" "$UDP_CONF"
