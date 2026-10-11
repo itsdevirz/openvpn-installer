@@ -95,7 +95,8 @@ PY
   cat > /usr/local/sbin/openvpn-quota-check <<'PY'
 #!/usr/bin/env python3
 import csv, glob, json, os, subprocess, time
-D='/var/lib/openvpn-manager'; STATUS='/var/log/openvpn/udp-status.log'
+D='/var/lib/openvpn-manager'; STATUS='/run/openvpn-server/status-udp.log'
+if not os.path.isfile(STATUS): STATUS='/var/log/openvpn/udp-status.log'
 def fw(args): subprocess.run(['/usr/sbin/iptables']+args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 def rule(args): return subprocess.run(['/usr/sbin/iptables','-C']+args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode==0
 # Remove prior quota blocks first only when the corresponding account is not blocked.
@@ -314,11 +315,9 @@ adopt_existing(){
   ./easyrsa build-ca nopass
   ./easyrsa gen-crl
   install -m 644 pki/crl.pem "$OVPN_DIR/manager-crl.pem"
-  if [[ -r "$OVPN_DIR/crl-before-manager.pem" ]]; then
-    cat "$OVPN_DIR/crl-before-manager.pem" "$OVPN_DIR/manager-crl.pem" > "$OVPN_DIR/crl-manager-bundle.pem"
-  else
-    install -m 644 "$OVPN_DIR/manager-crl.pem" "$OVPN_DIR/crl-manager-bundle.pem"
-  fi
+  # OpenVPN reads one CRL from a PEM file; use the manager CA's CRL directly.
+  # This instance had no active crl-verify directive before adoption.
+  install -m 644 "$OVPN_DIR/manager-crl.pem" "$OVPN_DIR/crl-manager-bundle.pem"
   chmod 644 "$OVPN_DIR/crl-manager-bundle.pem"
   # Preserve the existing UDP CA and add the manager CA; leave the TCP trust chain untouched.
   cat "$OVPN_DIR/ca-before-manager.crt" "$PKI_DIR/pki/ca.crt" > "$OVPN_DIR/ca-manager-bundle.crt"
@@ -428,11 +427,8 @@ revoke_client(){
   ./easyrsa gen-crl
   if [[ -f "$OVPN_DIR/manager-crl.pem" ]]; then
     install -m 644 pki/crl.pem "$OVPN_DIR/manager-crl.pem"
-    if [[ -r "$OVPN_DIR/crl-before-manager.pem" ]]; then
-      cat "$OVPN_DIR/crl-before-manager.pem" "$OVPN_DIR/manager-crl.pem" > "$OVPN_DIR/crl-manager-bundle.pem"
-    else
-      install -m 644 "$OVPN_DIR/manager-crl.pem" "$OVPN_DIR/crl-manager-bundle.pem"
-    fi
+    # Keep the active CRL as a single manager-CA CRL PEM.
+    install -m 644 "$OVPN_DIR/manager-crl.pem" "$OVPN_DIR/crl-manager-bundle.pem"
     chmod 644 "$OVPN_DIR/crl-manager-bundle.pem"
   else
     install -m 644 pki/crl.pem "$OVPN_DIR/crl.pem"
