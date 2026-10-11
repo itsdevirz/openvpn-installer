@@ -274,8 +274,10 @@ adopt_existing(){
   install -m 644 pki/crl.pem "$OVPN_DIR/manager-crl.pem"
   if [[ -r "$OVPN_DIR/crl-before-manager.pem" ]]; then
     cat "$OVPN_DIR/crl-before-manager.pem" "$OVPN_DIR/manager-crl.pem" > "$OVPN_DIR/crl-manager-bundle.pem"
-    chmod 644 "$OVPN_DIR/crl-manager-bundle.pem"
+  else
+    install -m 644 "$OVPN_DIR/manager-crl.pem" "$OVPN_DIR/crl-manager-bundle.pem"
   fi
+  chmod 644 "$OVPN_DIR/crl-manager-bundle.pem"
   # Keep the old trust certificate and append the manager CA for newly issued clients.
   cat "$OVPN_DIR/ca-before-manager.crt" "$PKI_DIR/pki/ca.crt" > "$OVPN_DIR/ca-manager-bundle.crt"
   chmod 644 "$OVPN_DIR/ca-manager-bundle.crt"
@@ -286,7 +288,7 @@ adopt_existing(){
     sed -i -E "s|^[[:space:]]*crl-verify[[:space:]]+.*|crl-verify $OVPN_DIR/crl-manager-bundle.pem|" "$SERVER_CONF"
   else echo "crl-verify $OVPN_DIR/crl-manager-bundle.pem" >> "$SERVER_CONF"; fi
   grep -Eq '^[[:space:]]*client-config-dir[[:space:]]' "$SERVER_CONF" || echo "client-config-dir $CCD_DIR" >> "$SERVER_CONF"
-  if grep -Eq '^[[:space:]]*ifconfig-pool[[:space:]]' "$SERVER_CONF"; then sed -i -E 's|^[[:space:]]*ifconfig-pool[[:space:]].*|ifconfig-pool 10.8.0.2 10.8.0.9 255.255.255.0|' "$SERVER_CONF"; else echo 'ifconfig-pool 10.8.0.2 10.8.0.9 255.255.255.0' >> "$SERVER_CONF"; fi
+  # Keep the existing server pool unchanged; OpenVPN's server directive manages the dynamic pool.
   grep -Eq '^[[:space:]]*client-connect[[:space:]]' "$SERVER_CONF" || echo 'client-connect /usr/local/sbin/openvpn-client-connect' >> "$SERVER_CONF"
   grep -Eq '^[[:space:]]*script-security[[:space:]]' "$SERVER_CONF" || echo 'script-security 2' >> "$SERVER_CONF"
   grep -Eq '^[[:space:]]*status[[:space:]]' "$SERVER_CONF" || echo 'status /var/log/openvpn/status.log 10' >> "$SERVER_CONF"
@@ -387,8 +389,10 @@ revoke_client(){
     install -m 644 pki/crl.pem "$OVPN_DIR/manager-crl.pem"
     if [[ -r "$OVPN_DIR/crl-before-manager.pem" ]]; then
       cat "$OVPN_DIR/crl-before-manager.pem" "$OVPN_DIR/manager-crl.pem" > "$OVPN_DIR/crl-manager-bundle.pem"
-      chmod 644 "$OVPN_DIR/crl-manager-bundle.pem"
+    else
+      install -m 644 "$OVPN_DIR/manager-crl.pem" "$OVPN_DIR/crl-manager-bundle.pem"
     fi
+    chmod 644 "$OVPN_DIR/crl-manager-bundle.pem"
   else
     install -m 644 pki/crl.pem "$OVPN_DIR/crl.pem"
   fi
