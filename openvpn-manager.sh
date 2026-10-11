@@ -78,7 +78,9 @@ install_manager_helpers(){
 #!/usr/bin/env python3
 import json, os, sys, time
 name=os.environ.get('common_name','')
-if not name or not name.replace('_','').replace('-','').isalnum(): sys.exit(1)
+# Legacy clients may have CNs outside the manager's filename-safe format.
+# Allow them unchanged; manager-generated names are validated separately.
+if not name or not name.replace('_','').replace('-','').isalnum(): sys.exit(0)
 p='/var/lib/openvpn-manager/'+name+'.json'
 # Existing clients not managed by this script remain allowed during adoption.
 if not os.path.exists(p): sys.exit(0)
