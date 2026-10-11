@@ -362,6 +362,7 @@ PY
   { printf 'client\ndev tun\nproto udp\nremote %s %s\nresolv-retry infinite\nnobind\npersist-key\npersist-tun\nremote-cert-tls server\nauth SHA256\ndata-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305\nmssfix 1360\nverb 3\nkey-direction 1\n<ca>\n' "$endpoint" "$PROFILE_PORT"; if [[ -r "$OVPN_DIR/ca-manager-bundle.crt" ]]; then cat "$OVPN_DIR/ca-manager-bundle.crt"; elif [[ -r "$OVPN_DIR/ca-before-manager.crt" ]]; then cat "$OVPN_DIR/ca-before-manager.crt"; else cat "$PKI_DIR/pki/ca.crt"; fi; printf '</ca>\n<cert>\n'; awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/' "$PKI_DIR/pki/issued/$name.crt"; printf '</cert>\n<key>\n'; cat "$PKI_DIR/pki/private/$name.key"; printf '</key>\n<tls-auth>\n'; cat "$OVPN_DIR/ta.key"; printf '</tls-auth>\n'; } > "$out"
   chmod 600 "$out"
   systemctl reload openvpn-server@server 2>/dev/null || systemctl restart openvpn-server@server
+  systemctl reload openvpn-server@udp 2>/dev/null || systemctl restart openvpn-server@udp
   echo "Client profile created: $out"
   echo "Assigned IP: $ip | Validity: $days days | quota: ${quota} GB (0=unlimited)"
   echo 'Transfer the .ovpn file securely. Anyone who has it can use this account.'
@@ -406,7 +407,7 @@ PY
 status(){
   echo '--- Service ---'; systemctl --no-pager --full status openvpn-server@udp 2>/dev/null | head -n 12 || true
   echo '--- Listening ports ---'; ss -lunp | grep -E ":${PROFILE_PORT:-34871}[[:space:]]" || true
-  echo '--- Connected clients ---'; if [[ -r /var/log/openvpn/status.log ]]; then awk -F, '$1=="CLIENT_LIST" {print $2, $3, "RX=" $5, "TX=" $6}' /var/log/openvpn/status.log; else echo 'Status file not found'; fi
+  echo '--- Connected clients ---'; if [[ -r /var/log/openvpn/udp-status.log ]]; then awk -F, '$1=="CLIENT_LIST" {print $2, $3, "RX=" $6, "TX=" $7}' /var/log/openvpn/udp-status.log; else echo 'Status file not found'; fi
   echo '--- Quota timer ---'; systemctl --no-pager status openvpn-quota-check.timer 2>/dev/null | head -n 8 || true
 }
 
