@@ -344,6 +344,21 @@ adopt_existing(){
   fi
   grep -Eq '^[[:space:]]*status-version[[:space:]]' "$UDP_CONF" || echo 'status-version 2' >> "$UDP_CONF"
   grep -Eq '^[[:space:]]*mssfix[[:space:]]+1360([[:space:]]|$)' "$UDP_CONF" || echo 'mssfix 1360' >> "$UDP_CONF"
+  # Disable the implicit pool created by the server directive.
+  python3 - "$UDP_CONF" <<'PYUDP'
+import re, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+lines = p.read_text().splitlines()
+for i, line in enumerate(lines):
+    if re.match(r'^\s*server\s+10\.9\.0\.0\s+255\.255\.255\.0(?:\s|$)', line):
+        if not re.search(r'\bnopool\b', line):
+            lines[i] = line + ' nopool'
+        break
+else:
+    raise SystemExit("Expected UDP server directive not found")
+p.write_text('\n'.join(lines) + '\n')
+PYUDP
   # Reserve 10.9.0.2-10.9.0.127 for manager CCD clients; keep dynamic clients in .128-.253.
   if grep -Eq '^[[:space:]]*ifconfig-pool[[:space:]]' "$UDP_CONF"; then
     sed -i -E 's|^[[:space:]]*ifconfig-pool[[:space:]]+.*|ifconfig-pool 10.9.0.128 10.9.0.253 255.255.255.0|' "$UDP_CONF"
