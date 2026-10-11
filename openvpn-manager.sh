@@ -464,7 +464,14 @@ PY
 status(){
   echo '--- Service ---'; systemctl --no-pager --full status openvpn-server@udp 2>/dev/null | head -n 12 || true
   echo '--- Listening ports ---'; ss -lunp | grep -E ":${PROFILE_PORT:-34871}[[:space:]]" || true
-  echo '--- Connected clients ---'; if [[ -r /var/log/openvpn/udp-status.log ]]; then awk -F, '$1=="CLIENT_LIST" {print $2, $3, "RX=" $6, "TX=" $7}' /var/log/openvpn/udp-status.log; else echo 'Status file not found'; fi
+  echo '--- Connected clients ---'
+  local status_file=/run/openvpn-server/status-udp.log
+  [[ -r "$status_file" ]] || status_file="$PROFILE_STATUS"
+  if [[ -r "$status_file" ]]; then
+    awk -F, '$1=="CLIENT_LIST" {print $2, $3, "RX=" $6, "TX=" $7}' "$status_file"
+  else
+    echo "Status file not found (checked /run/openvpn-server/status-udp.log and $PROFILE_STATUS)"
+  fi
   echo '--- Quota timer ---'; systemctl --no-pager status openvpn-quota-check.timer 2>/dev/null | head -n 8 || true
 }
 
